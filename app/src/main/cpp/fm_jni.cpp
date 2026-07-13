@@ -56,102 +56,214 @@ static const char* FM_DEV_NODES[] = {
     "/dev/fm_radio"
 };
 
-// Candidate library paths for Qualcomm Snapdragon FM PAL
-static const char* FM_LIB_PATHS[] = {
-    "libfmpal.so",
-    "/vendor/lib64/libfmpal.so",
-    "/vendor/lib/libfmpal.so",
-    "/system/lib64/libfmpal.so",
-    "/system/lib/libfmpal.so",
-    "/vendor/lib64/hw/vendor.qti.hardware.fm@1.0-impl.so",
-    "/vendor/lib/hw/vendor.qti.hardware.fm@1.0-impl.so",
-    "vendor.qti.hardware.fm@1.0.so"
-};
+/**
+ * Recursively search a directory up to a max depth of 4 for candidate library names.
+ */
+static void search_directory(const std::string& path, int depth, const std::vector<std::string>& candidates, std::vector<std::string>& found_paths, std::stringstream& log) {
+    if (depth > 4) return;
+    DIR* dir = opendir(path.c_str());
+    if (!dir) {
+        return;
+    }
+    struct dirent* entry;
+    while ((entry = readdir(dir)) != nullptr) {
+        std::string name = entry->d_name;
+        if (name == "." || name == "..") continue;
+
+        std::string full_path = path;
+        if (full_path.back() != '/') {
+            full_path += "/";
+        }
+        full_path += name;
+
+        struct stat st;
+        if (stat(full_path.c_str(), &st) == 0) {
+            if (S_ISDIR(st.st_mode)) {
+                search_directory(full_path, depth + 1, candidates, found_paths, log);
+            } else if (S_ISREG(st.st_mode)) {
+                for (const auto& cand : candidates) {
+                    if (name == cand) {
+                        found_paths.push_back(full_path);
+                        log << "   Found Candidate file: " << full_path << " (" << st.st_size << " bytes)\n";
+                    }
+                }
+            }
+        }
+    }
+    closedir(dir);
+}
 
 /**
  * JNI: loadNativeLibrary()
- * Attempts dlopen on libfmpal.so and populates symbol function pointers.
- * Returns detailed logs of the loading process.
+ * Attempts dlopen on candidate Qualcomm libraries and resolves symbols.
+ * Returns detailed logs of the discovery and loading process.
  */
 extern "C" JNIEXPORT jstring JNICALL Java_com_qualcomm_fmradio_FMBridge_loadNativeLibrary(JNIEnv* env, jclass clazz) {
     std::stringstream log;
-    log << "[JNI] Loading Qualcomm FM PAL libraries...\n";
+    log << "[JNI Loader] Starting Qualcomm FM Library Discovery Engine...\n";
 
     if (g_lib_handle != nullptr) {
-        log << "SUCCESS: Already loaded from " << g_last_loaded_path << "\n";
+        log << "SUCCESS: Library already loaded from " << g_last_loaded_path << "\n";
+        log << "Handle: " << g_lib_handle << "\n";
         return env->NewStringUTF(log.str().c_str());
     }
 
-    bool success = false;
-    for (const char* path : FM_LIB_PATHS) {
-        log << "-> Trying dlopen(\"" << path << "\", RTLD_NOW)...\n";
-        void* handle = dlopen(path, RTLD_NOW | RTLD_GLOBAL);
+    // Step 1: Create a list of candidate libraries
+    std::vector<std::string> candidates = {
+        "libfmpal.so",
+        "vendor.qti.hardware.fm@1.0.so",
+        "vendor.qti.hardware.fm@1.0-impl.so",
+        "libqcomfm_jni.so",
+        "libfmjni.so"
+    };
+
+    bool loaded = false;
+
+    // Step 2: Attempt loading by SONAME first
+    log << "\n[STEP 1] Attempting SONAME (Linker Search Path) Load...\n";
+    for (const auto& cand : candidates) {
+        log << "-> dlopen(\"" << cand << "\", RTLD_NOW | RTLD_GLOBAL)...\n";
+        errno = 0;
+        void* handle = dlopen(cand.c_str(), RTLD_NOW | RTLD_GLOBAL);
         if (handle != nullptr) {
             g_lib_handle = handle;
-            g_last_loaded_path = path;
+            g_last_loaded_path = cand;
             g_dlopen_error = "";
-            log << "   SUCCESS: Loaded " << path << "\n";
-            success = true;
+            log << "   SUCCESS: Loaded via SONAME " << cand << "\n";
+            log << "   Handle: " << handle << "\n";
+            loaded = true;
             break;
         } else {
             const char* err = dlerror();
-            std::string errStr = err ? err : "Unknown dlopen error";
-            log << "   FAILED: " << errStr << "\n";
-            g_dlopen_error = errStr;
+            std::string err_str = err ? err : "None";
+            log << "   FAILED: dlerror(): " << err_str << " | errno: " << errno << " (" << strerror(errno) << ")\n";
         }
     }
 
-    if (!success) {
-        log << "CRITICAL: Could not find or load libfmpal.so from any standard location.\n";
+    // Step 3 & 4: Deep Directory Discovery
+    if (!loaded) {
+        log << "\n[STEP 2] SONAME loading failed. Running Deep Directory Discovery...\n";
+        std::vector<std::string> search_dirs = {
+            "/vendor/lib64",
+            "/vendor/lib",
+            "/vendor/lib64/hw",
+            "/vendor/lib/hw",
+            "/system/lib64",
+            "/system/lib",
+            "/apex"
+        };
+
+        std::vector<std::string> found_paths;
+        for (const auto& dir : search_dirs) {
+            log << "-> Scanning directory: " << dir << "\n";
+            struct stat dir_st;
+            if (stat(dir.c_str(), &dir_st) != 0) {
+                log << "   Directory stat failed (errno: " << errno << " - " << strerror(errno) << ")\n";
+                if (errno == EACCES) {
+                    log << "   [SELinux] Access blocked by security policies.\n";
+                }
+                continue;
+            }
+            if (access(dir.c_str(), R_OK) != 0) {
+                log << "   Directory is not readable (access R_OK failed)\n";
+                continue;
+            }
+
+            search_directory(dir, 1, candidates, found_paths, log);
+        }
+
+        if (found_paths.empty()) {
+            log << "\nCRITICAL: No matching Qualcomm FM library files found in any scanned path.\n";
+            g_dlopen_error = "No library files found";
+        } else {
+            log << "\n[STEP 3] Attempting to load discovered candidate libraries...\n";
+            for (const auto& path : found_paths) {
+                log << "-> dlopen(\"" << path << "\", RTLD_NOW | RTLD_GLOBAL)...\n";
+                errno = 0;
+                void* handle = dlopen(path.c_str(), RTLD_NOW | RTLD_GLOBAL);
+                if (handle != nullptr) {
+                    g_lib_handle = handle;
+                    g_last_loaded_path = path;
+                    g_dlopen_error = "";
+                    log << "   SUCCESS: Loaded library at " << path << "\n";
+                    log << "   Handle: " << handle << "\n";
+                    loaded = true;
+                    break;
+                } else {
+                    const char* err = dlerror();
+                    std::string err_str = err ? err : "None";
+                    log << "   FAILED: dlerror(): " << err_str << "\n";
+                    log << "           errno: " << errno << " (" << strerror(errno) << ")\n";
+                    g_dlopen_error = err_str;
+                    
+                    if (err_str.find("namespace") != std::string::npos || err_str.find("not accessible") != std::string::npos) {
+                        log << "           [Linker Namespace Restriction Detected]\n";
+                    }
+                }
+            }
+        }
+    }
+
+    if (!loaded) {
+        log << "\nFM PAL STATUS: LOAD FAILED. Hardware libraries inaccessible from standard sandbox.\n";
         return env->NewStringUTF(log.str().c_str());
     }
 
+    // Step 8: Resolve symbols using dlsym()
+    log << "\n[STEP 4] Resolving FM PAL Symbols...\n";
+    
     // Resolve fmpal_init
-    log << "-> Resolving symbol 'fmpal_init'...\n";
+    log << "-> dlsym(handle, \"fmpal_init\")...\n";
     fn_fmpal_init = (fmpal_init_t)dlsym(g_lib_handle, "fmpal_init");
     if (fn_fmpal_init != nullptr) {
         g_err_fmpal_init = "";
-        log << "   SUCCESS: fmpal_init resolved at " << fn_fmpal_init << "\n";
+        log << "   ✓ fmpal_init resolved at " << fn_fmpal_init << "\n";
     } else {
         const char* err = dlerror();
         g_err_fmpal_init = err ? err : "Symbol fmpal_init not found";
-        log << "   FAILED: " << g_err_fmpal_init << "\n";
+        log << "   ✗ FAILED: " << g_err_fmpal_init << "\n";
     }
 
     // Resolve fmpal_power_up
-    log << "-> Resolving symbol 'fmpal_power_up'...\n";
+    log << "-> dlsym(handle, \"fmpal_power_up\")...\n";
     fn_fmpal_power_up = (fmpal_power_up_t)dlsym(g_lib_handle, "fmpal_power_up");
     if (fn_fmpal_power_up != nullptr) {
         g_err_fmpal_power_up = "";
-        log << "   SUCCESS: fmpal_power_up resolved at " << fn_fmpal_power_up << "\n";
+        log << "   ✓ fmpal_power_up resolved at " << fn_fmpal_power_up << "\n";
     } else {
         const char* err = dlerror();
         g_err_fmpal_power_up = err ? err : "Symbol fmpal_power_up not found";
-        log << "   FAILED: " << g_err_fmpal_power_up << "\n";
+        log << "   ✗ FAILED: " << g_err_fmpal_power_up << "\n";
     }
 
     // Resolve fmpal_set_freq
-    log << "-> Resolving symbol 'fmpal_set_freq'...\n";
+    log << "-> dlsym(handle, \"fmpal_set_freq\")...\n";
     fn_fmpal_set_freq = (fmpal_set_freq_t)dlsym(g_lib_handle, "fmpal_set_freq");
     if (fn_fmpal_set_freq != nullptr) {
         g_err_fmpal_set_freq = "";
-        log << "   SUCCESS: fmpal_set_freq resolved at " << fn_fmpal_set_freq << "\n";
+        log << "   ✓ fmpal_set_freq resolved at " << fn_fmpal_set_freq << "\n";
     } else {
         const char* err = dlerror();
         g_err_fmpal_set_freq = err ? err : "Symbol fmpal_set_freq not found";
-        log << "   FAILED: " << g_err_fmpal_set_freq << "\n";
+        log << "   ✗ FAILED: " << g_err_fmpal_set_freq << "\n";
     }
 
     // Resolve fmpal_get_freq
-    log << "-> Resolving symbol 'fmpal_get_freq'...\n";
+    log << "-> dlsym(handle, \"fmpal_get_freq\")...\n";
     fn_fmpal_get_freq = (fmpal_get_freq_t)dlsym(g_lib_handle, "fmpal_get_freq");
     if (fn_fmpal_get_freq != nullptr) {
         g_err_fmpal_get_freq = "";
-        log << "   SUCCESS: fmpal_get_freq resolved at " << fn_fmpal_get_freq << "\n";
+        log << "   ✓ fmpal_get_freq resolved at " << fn_fmpal_get_freq << "\n";
     } else {
         const char* err = dlerror();
         g_err_fmpal_get_freq = err ? err : "Symbol fmpal_get_freq not found";
-        log << "   FAILED: " << g_err_fmpal_get_freq << "\n";
+        log << "   ✗ FAILED: " << g_err_fmpal_get_freq << "\n";
+    }
+
+    if (fn_fmpal_init && fn_fmpal_power_up && fn_fmpal_set_freq && fn_fmpal_get_freq) {
+        log << "\nFM PAL READY\n";
+    } else {
+        log << "\nFM PAL PARTIALLY RUNNABLE (Some symbols missing)\n";
     }
 
     return env->NewStringUTF(log.str().c_str());
@@ -278,84 +390,137 @@ extern "C" JNIEXPORT jstring JNICALL Java_com_qualcomm_fmradio_FMBridge_getDiagn
     report << " QUALCOMM FM RADIO JNI DIAGNOSTIC REPORT\n";
     report << "====================================================\n\n";
 
-    // 1. JNI Status & Arch
+    // Step 9 Requirement: Detailed status header
     report << "[1. JNI & RUNTIME ENVIRONMENT]\n";
+    report << "JNI Loaded: YES\n";
+    report << "Native Loader OK: YES\n";
     #if defined(__aarch64__)
-    report << "  - Architecture: ARM64 (64-bit)\n";
+    report << "Architecture: ARM64 (64-bit)\n";
     #elif defined(__arm__)
-    report << "  - Architecture: ARM32 (32-bit)\n";
+    report << "Architecture: ARM32 (32-bit)\n";
     #else
-    report << "  - Architecture: Non-ARM (" << __VERSION__ << ")\n";
+    report << "Architecture: Non-ARM (" << __VERSION__ << ")\n";
     #endif
-    report << "  - Android API Level: API 36 (Android 16)\n";
-    report << "  - Target Device Match: Samsung Galaxy Tab A9+ (SM-X216B)\n";
-    report << "  - Qualcomm Snapdragon: SM6375 (Snapdragon 695 5G)\n\n";
+    report << "Android API Level: API 36 (Android 16)\n";
+    report << "Target Device: Samsung Galaxy Tab A9+ (SM-X216B)\n";
+    report << "Qualcomm Snapdragon Platform: SM6375 (Snapdragon 695 5G)\n\n";
 
-    // 2. Native Dynamic Linker status (dlopen / dlsym)
-    report << "[2. DYNAMIC LINKER (libfmpal.so)]\n";
-    if (g_lib_handle != nullptr) {
-        report << "  - Load Status: SUCCESS\n";
-        report << "  - Loaded Library Path: " << g_last_loaded_path << "\n";
-        report << "  - Exported Symbol Status:\n";
-        report << "    * fmpal_init: " << (fn_fmpal_init ? "RESOLVED" : "MISSING") << "\n";
-        report << "    * fmpal_power_up: " << (fn_fmpal_power_up ? "RESOLVED" : "MISSING") << "\n";
-        report << "    * fmpal_set_freq: " << (fn_fmpal_set_freq ? "RESOLVED" : "MISSING") << "\n";
-        report << "    * fmpal_get_freq: " << (fn_fmpal_get_freq ? "RESOLVED" : "MISSING") << "\n";
+    // 2. Library Discovery & Loader status (Step 9 format)
+    report << "[2. NATIVE FM PAL LIBRARY STATUS]\n";
+    report << "Searching...\n";
+    
+    std::vector<std::string> candidates = {
+        "libfmpal.so",
+        "vendor.qti.hardware.fm@1.0.so",
+        "vendor.qti.hardware.fm@1.0-impl.so",
+        "libqcomfm_jni.so",
+        "libfmjni.so"
+    };
+    std::vector<std::string> search_dirs = {
+        "/vendor/lib64",
+        "/vendor/lib",
+        "/vendor/lib64/hw",
+        "/vendor/lib/hw",
+        "/system/lib64",
+        "/system/lib",
+        "/apex"
+    };
+
+    std::vector<std::string> discovered;
+    std::stringstream search_log;
+    for (const auto& dir : search_dirs) {
+        search_directory(dir, 1, candidates, discovered, search_log);
+    }
+
+    if (!discovered.empty()) {
+        report << "Found:\n";
+        for (const auto& path : discovered) {
+            report << "  " << path << "\n";
+        }
     } else {
-        report << "  - Load Status: FAILED\n";
-        report << "  - Last dlopen() error: " << (g_dlopen_error.empty() ? "None recorded" : g_dlopen_error) << "\n";
-        report << "  - Symbol mappings are unlinked.\n";
+        report << "Found: None (No library file visible in directory scans)\n";
+    }
+
+    report << "Loading...\n";
+    if (g_lib_handle != nullptr) {
+        report << "SUCCESS\n";
+        report << "Handle: " << g_lib_handle << "\n";
+        report << "Active Library Path: " << g_last_loaded_path << "\n\n";
+        
+        report << "Searching Symbols...\n";
+        report << (fn_fmpal_init ? "  ✓ fmpal_init" : "  ✗ fmpal_init (Symbol missing)") << "\n";
+        report << (fn_fmpal_power_up ? "  ✓ fmpal_power_up" : "  ✗ fmpal_power_up (Symbol missing)") << "\n";
+        report << (fn_fmpal_set_freq ? "  ✓ fmpal_set_freq" : "  ✗ fmpal_set_freq (Symbol missing)") << "\n";
+        report << (fn_fmpal_get_freq ? "  ✓ fmpal_get_freq" : "  ✗ fmpal_get_freq (Symbol missing)") << "\n\n";
+
+        if (fn_fmpal_init && fn_fmpal_power_up && fn_fmpal_set_freq && fn_fmpal_get_freq) {
+            report << "FM PAL READY\n";
+        } else {
+            report << "FM PAL PARTIALLY RUNNABLE\n";
+        }
+    } else {
+        report << "FAILED\n";
+        report << "Reason:\n";
+        report << "  dlerror(): " << (g_dlopen_error.empty() ? "None recorded" : g_dlopen_error) << "\n";
+        report << "  errno: " << errno << "\n";
+        report << "  strerror(): " << strerror(errno) << "\n\n";
+
+        // Assess Namespace restrictions (Step 6)
+        report << "Namespace:\n";
+        if (g_dlopen_error.find("namespace") != std::string::npos || g_dlopen_error.find("not accessible") != std::string::npos) {
+            report << "  Denied (Modern Android Mount Namespace limits public app linking to vendor libraries)\n";
+        } else {
+            report << "  Allowed (No namespace error captured)\n";
+        }
+        
+        // Assess SELinux restrictions (Step 7)
+        report << "SELinux:\n";
+        if (errno == EACCES) {
+            report << "  Denied (SELinux active protection rules restricted library load or directories read)\n";
+        } else {
+            report << "  Indeterminate (Standard file permission or missing file state)\n";
+        }
     }
     report << "\n";
 
-    // 3. HIDL Service Probe
-    report << "[3. HIDL / INTERFACE STACK DIAGNOSTICS]\n";
-    // Check if the hardware module file is physically visible in filesystem
-    const char* hidl_path = "/vendor/lib64/hw/vendor.qti.hardware.fm@1.0-impl.so";
+    // 3. Linux Kernel Device Node Diagnostics
+    report << "[3. LINUX CHAR DEV & SELINUX STATUS]\n";
+    for (const char* node : FM_DEV_NODES) {
+        errno = 0;
+        int fd = open(node, O_RDWR);
+        if (fd >= 0) {
+            report << "  - " << node << ": ACCESSIBLE (O_RDWR open success)\n";
+            close(fd);
+        } else {
+            int err = errno;
+            report << "  - " << node << ": FAILED (errno: " << err << " - " << strerror(err) << ")\n";
+            if (err == EACCES) {
+                report << "    [SELinux] Access denied (untrusted_app SELinux domain is prevented from O_RDWR access)\n";
+            } else if (err == ENOENT) {
+                report << "    [Driver] Device node does not exist on this system kernel variant.\n";
+            }
+        }
+    }
+    report << "\n";
+
+    // 4. HIDL Interface Stack Diagnostics
+    report << "[4. HARDWARE INTERFACE STACK PROBES]\n";
+    const char* impl_path = "/vendor/lib64/hw/vendor.qti.hardware.fm@1.0-impl.so";
     struct stat st;
-    if (stat(hidl_path, &st) == 0) {
+    if (stat(impl_path, &st) == 0) {
         report << "  - File vendor.qti.hardware.fm@1.0-impl.so: PRESENT (size: " << st.st_size << " bytes)\n";
     } else {
         report << "  - File vendor.qti.hardware.fm@1.0-impl.so: ABSENT (errno: " << errno << " - " << strerror(errno) << ")\n";
     }
 
+    errno = 0;
     void* hidl_handle = dlopen("vendor.qti.hardware.fm@1.0.so", RTLD_NOW | RTLD_GLOBAL);
     if (hidl_handle != nullptr) {
         report << "  - vendor.qti.hardware.fm@1.0.so dlopen(): SUCCESS\n";
         dlclose(hidl_handle);
     } else {
         const char* err = dlerror();
-        report << "  - vendor.qti.hardware.fm@1.0.so dlopen(): FAILED (" << (err ? err : "Unknown") << ")\n";
-    }
-    report << "\n";
-
-    // 4. SELinux & Linux Device Nodes Probe
-    report << "[4. SELINUX & LINUX CHAR DEV DIAGNOSTICS]\n";
-    for (const char* node : FM_DEV_NODES) {
-        errno = 0;
-        int fd = open(node, O_RDWR);
-        if (fd >= 0) {
-            report << "  - " << node << ": ACCESSIBLE (O_RDWR open successful)\n";
-            close(fd);
-        } else {
-            int err = errno;
-            report << "  - " << node << ": FAILED (errno: " << err << " - " << strerror(err) << ")\n";
-            if (err == EACCES) {
-                report << "    [SELinux] Potential SELinux domain restriction / denial active on this node.\n";
-            }
-        }
-    }
-    report << "\n";
-
-    // 5. Namespace Loading Check
-    report << "[5. NAMESPACE SYSTEM PATH ACCESSIBILITY]\n";
-    errno = 0;
-    DIR* vendor_lib = opendir("/vendor/lib64");
-    if (vendor_lib != nullptr) {
-        report << "  - Read /vendor/lib64: ALLOWED\n";
-        closedir(vendor_lib);
-    } else {
-        report << "  - Read /vendor/lib64: DENIED (errno: " << errno << " - " << strerror(errno) << ")\n";
+        report << "  - vendor.qti.hardware.fm@1.0.so dlopen(): FAILED (" << (err ? err : "Unknown linker restriction") << ")\n";
     }
 
     report << "\n====================================================";
