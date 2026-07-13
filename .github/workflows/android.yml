@@ -34,17 +34,20 @@ jobs:
         echo "Installing Android NDK r27..."
         ${ANDROID_SDK_ROOT}/cmdline-tools/latest/bin/sdkmanager --install "ndk;27.0.12077973" "cmake;3.22.1"
 
+    - name: Ensure Gradle Wrapper Jar Exists
+      run: |
+        mkdir -p gradle/wrapper
+        if [ ! -f "gradle/wrapper/gradle-wrapper.jar" ] || [ ! -s "gradle/wrapper/gradle-wrapper.jar" ]; then
+          echo "Gradle wrapper jar is missing or empty. Downloading..."
+          curl -sSLo gradle/wrapper/gradle-wrapper.jar https://raw.githubusercontent.com/gradle/gradle/v8.8.0/gradle/wrapper/gradle-wrapper.jar
+        fi
+
     - name: Grant Execute Permission to Gradle Wrapper
       run: chmod +x gradlew
-      continue-on-error: true # Safe fallback if wrapper is not physically committed yet
 
     - name: Compile Native C++ and Kotlin App (Release)
       run: |
-        if [ -f "./gradlew" ]; then
-          ./gradlew assembleRelease
-        else
-          gradle assembleRelease
-        fi
+        ./gradlew assembleRelease
 
     - name: Archive Compiled JNI Shared Library Artifacts
       uses: actions/upload-artifact@v4

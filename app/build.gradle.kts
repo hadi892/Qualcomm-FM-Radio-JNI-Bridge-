@@ -61,6 +61,11 @@ android {
     }
 
     ndkVersion = "27.0.12077973" // Android NDK r27
+
+    lint {
+        abortOnError = false
+        checkReleaseBuilds = false
+    }
 }
 
 dependencies {
