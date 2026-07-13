@@ -37,8 +37,8 @@ jobs:
     - name: Ensure Gradle Wrapper Jar Exists
       run: |
         mkdir -p gradle/wrapper
-        if [ ! -f "gradle/wrapper/gradle-wrapper.jar" ] || [ ! -s "gradle/wrapper/gradle-wrapper.jar" ]; then
-          echo "Gradle wrapper jar is missing or empty. Downloading..."
+        if [ ! -f "gradle/wrapper/gradle-wrapper.jar" ] || [ ! -s "gradle/wrapper/gradle-wrapper.jar" ] || grep -q "git-lfs" "gradle/wrapper/gradle-wrapper.jar" || ! unzip -t "gradle/wrapper/gradle-wrapper.jar" >/dev/null 2>&1; then
+          echo "Gradle wrapper jar is missing, empty, a git-lfs pointer, or invalid. Downloading official binary..."
           curl -sSLo gradle/wrapper/gradle-wrapper.jar https://raw.githubusercontent.com/gradle/gradle/v8.8.0/gradle/wrapper/gradle-wrapper.jar
         fi
 
