@@ -3,8 +3,7 @@
   ~ @license
   ~ SPDX-License-Identifier: Apache-2.0
 -->
-<manifest xmlns:android="http://schemas.android.com/apk/res/android"
-    package="com.qualcomm.fmradio">
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
     <!-- Qualcomm Platform & BSP Radio Hardware Access Permission -->
     <uses-permission android:name="android.permission.ACCESS_FM_RADIO" />
@@ -20,10 +19,17 @@
 
     <application
         android:allowBackup="true"
-        android:label="Qualcomm Snapdragon FM Radio JNI"
-        android:theme="@android:style/Theme.DeviceDefault.NoActionBar">
+        android:label="Qualcomm FM Radio Bridge"
+        android:theme="@style/Theme.AppCompat.Light.NoActionBar">
 
-        <!-- Low-level services can be declared here if needed -->
-        
+        <activity
+            android:name=".MainActivity"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
     </application>
 </manifest>

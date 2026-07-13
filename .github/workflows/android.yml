@@ -45,18 +45,36 @@ jobs:
     - name: Grant Execute Permission to Gradle Wrapper
       run: chmod +x gradlew
 
-    - name: Compile Native C++ and Kotlin App (Release)
+    - name: Compile Native C++ and Kotlin App (Debug & Release)
       run: |
-        ./gradlew assembleRelease
+        ./gradlew assembleDebug assembleRelease
 
-    - name: Archive Compiled JNI Shared Library Artifacts
+    - name: Archive Compiled Debug Application Package (APK)
       uses: actions/upload-artifact@v4
       with:
-        name: qualcomm-fm-jni-so
-        path: app/build/intermediates/cmake/release/obj/arm64-v8a/libfm_jni.so
+        name: qualcomm-fm-app-debug
+        path: app/build/outputs/apk/debug/*.apk
+        if-no-files-found: warn
 
-    - name: Archive Compiled Android Application Package
+    - name: Archive Compiled Release Application Package (APK)
       uses: actions/upload-artifact@v4
       with:
         name: qualcomm-fm-app-release
-        path: app/build/outputs/apk/**/*.apk
+        path: app/build/outputs/apk/release/*.apk
+        if-no-files-found: warn
+
+    - name: Archive JNI Native Shared Libraries (.so)
+      uses: actions/upload-artifact@v4
+      with:
+        name: qualcomm-fm-jni-libraries
+        path: |
+          app/build/intermediates/stripped_native_libs/release/out/lib/arm64-v8a/*.so
+          app/build/intermediates/cmake/release/obj/arm64-v8a/*.so
+        if-no-files-found: warn
+
+    - name: Archive ProGuard Code Optimization Mappings
+      uses: actions/upload-artifact@v4
+      with:
+        name: qualcomm-fm-proguard-mappings
+        path: app/build/outputs/mapping/release/mapping.txt
+        if-no-files-found: ignore

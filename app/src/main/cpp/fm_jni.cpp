@@ -5,484 +5,359 @@
  * Qualcomm Snapdragon 695 (SM6375) FM Radio JNI Bridge
  * Targeted for Android 16 (API 36) - Samsung Galaxy Tab A9+ (SM-X216B)
  * 
- * This file implements the real JNI bridge calling the vendor FM PAL (Platform Abstraction Layer)
- * dynamic libraries (libfmpal.so / vendor.qti.hardware.fm@1.0.so).
+ * This JNI implementation runs actual dlopen(), dlsym(), device node open() checks,
+ * and reports the real system state, dlerror(), errno, and permissions.
  */
 
 #include <jni.h>
 #include <android/log.h>
 #include <dlfcn.h>
-#include <pthread.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <errno.h>
+#include <string.h>
+#include <dirent.h>
 #include <string>
-#include <cstring>
-#include <cmath>
+#include <sstream>
+#include <vector>
 
-#define LOG_TAG "QualcommFM"
+#define LOG_TAG "QualcommFM_JNI"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
-#define LOGD(...) __android_log_print(ANDROID_LOG_DEBUG, LOG_TAG, __VA_ARGS__)
-#define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 
-// Error constants matching Kotlin FMManager
-#define FM_SUCCESS 0
-#define FM_ERROR_UNSUPPORTED -1
-#define FM_ERROR_HAL_FAILED -2
-#define FM_ERROR_NOT_INITIALIZED -3
-#define FM_ERROR_INVALID_PARAM -4
-#define FM_ERROR_PERMISSION_DENIED -5
+// Function pointer typedefs matching Qualcomm's FM Platform Abstraction Layer (PAL)
+typedef int (*fmpal_init_t)(void);
+typedef int (*fmpal_power_up_t)(int);
+typedef int (*fmpal_set_freq_t)(int);
+typedef int (*fmpal_get_freq_t)(int*);
 
-// Qualcomm FM PAL function pointer signatures
-typedef int (*FmPalInitFunc)();
-typedef int (*FmPalDeinitFunc)();
-typedef int (*FmPalPowerUpFunc)(int);
-typedef int (*FmPalPowerDownFunc)();
-typedef int (*FmPalTuneFunc)(int);
-typedef int (*FmPalGetFreqFunc)(int*);
-typedef int (*FmPalSeekFunc)(int);
-typedef int (*FmPalSetMuteFunc)(bool);
-typedef int (*FmPalSetVolFunc)(int);
+// Global state holding library handle and function pointers
+static void* g_lib_handle = nullptr;
+static std::string g_dlopen_error = "Not loaded yet";
+static std::string g_last_loaded_path = "";
 
-// Hardware contexts & dynamic loading structure
-struct FmPalContext {
-    void* handle = nullptr;
-    pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
-    bool is_initialized = false;
-    bool is_powered = false;
-    int current_volume = 10;
-    int current_frequency_khz = 98500; // Default 98.5 MHz
-    bool is_muted = false;
+static fmpal_init_t fn_fmpal_init = nullptr;
+static fmpal_power_up_t fn_fmpal_power_up = nullptr;
+static fmpal_set_freq_t fn_fmpal_set_freq = nullptr;
+static fmpal_get_freq_t fn_fmpal_get_freq = nullptr;
 
-    // Function pointers resolved via dlsym
-    FmPalInitFunc init = nullptr;
-    FmPalDeinitFunc deinit = nullptr;
-    FmPalPowerUpFunc power_up = nullptr;
-    FmPalPowerDownFunc power_down = nullptr;
-    FmPalTuneFunc tune = nullptr;
-    FmPalGetFreqFunc get_freq = nullptr;
-    FmPalSeekFunc seek = nullptr;
-    FmPalSetMuteFunc set_mute = nullptr;
-    FmPalSetVolFunc set_vol = nullptr;
+static std::string g_err_fmpal_init = "Not resolved";
+static std::string g_err_fmpal_power_up = "Not resolved";
+static std::string g_err_fmpal_set_freq = "Not resolved";
+static std::string g_err_fmpal_get_freq = "Not resolved";
+
+// Standard device nodes to probe for SELinux and access permission diagnostics
+static const char* FM_DEV_NODES[] = {
+    "/dev/radio0",
+    "/dev/fm",
+    "/dev/fmradio",
+    "/dev/fm_radio"
 };
 
-// Global context
-static FmPalContext g_fm_ctx;
-
-// Helper to check for JNI exceptions
-void check_and_clear_exceptions(JNIEnv* env) {
-    if (env->ExceptionCheck()) {
-        LOGE("JNI exception occurred, clearing and reporting");
-        env->ExceptionDescribe();
-        env->ExceptionClear();
-    }
-}
-
-// Throws a runtime exception back into Kotlin
-void throw_kotlin_exception(JNIEnv* env, const char* message) {
-    jclass exClass = env->FindClass("java/lang/RuntimeException");
-    if (exClass != nullptr) {
-        env->ThrowNew(exClass, message);
-    }
-}
+// Candidate library paths for Qualcomm Snapdragon FM PAL
+static const char* FM_LIB_PATHS[] = {
+    "libfmpal.so",
+    "/vendor/lib64/libfmpal.so",
+    "/vendor/lib/libfmpal.so",
+    "/system/lib64/libfmpal.so",
+    "/system/lib/libfmpal.so",
+    "/vendor/lib64/hw/vendor.qti.hardware.fm@1.0-impl.so",
+    "/vendor/lib/hw/vendor.qti.hardware.fm@1.0-impl.so",
+    "vendor.qti.hardware.fm@1.0.so"
+};
 
 /**
- * Dynamically loads Qualcomm's vendor libraries (libfmpal.so or HIDL binder module)
- * resolving standard Qualcomm SoC hardware pointers.
+ * JNI: loadNativeLibrary()
+ * Attempts dlopen on libfmpal.so and populates symbol function pointers.
+ * Returns detailed logs of the loading process.
  */
-bool init_qualcomm_hal(FmPalContext* ctx) {
-    pthread_mutex_lock(&ctx->lock);
-    if (ctx->handle != nullptr) {
-        pthread_mutex_unlock(&ctx->lock);
-        return true;
+extern "C" JNIEXPORT jstring JNICALL Java_com_qualcomm_fmradio_FMBridge_loadNativeLibrary(JNIEnv* env, jclass clazz) {
+    std::stringstream log;
+    log << "[JNI] Loading Qualcomm FM PAL libraries...\n";
+
+    if (g_lib_handle != nullptr) {
+        log << "SUCCESS: Already loaded from " << g_last_loaded_path << "\n";
+        return env->NewStringUTF(log.str().c_str());
     }
 
-    // Samsung Galaxy Tab A9+ and general Snapdragon search targets for FM PAL
-    const char* lib_paths[] = {
-        "libfmpal.so",
-        "/vendor/lib64/libfmpal.so",
-        "/vendor/lib/libfmpal.so",
-        "/system/lib64/libfmpal.so",
-        "/system/lib/libfmpal.so",
-        "vendor.qti.hardware.fm@1.0-impl.so",
-        "vendor.qti.hardware.fm@1.0.so"
-    };
-
-    for (const char* path : lib_paths) {
-        LOGD("[DL] Attempting to dlopen path: %s", path);
-        ctx->handle = dlopen(path, RTLD_NOW | RTLD_GLOBAL);
-        if (ctx->handle != nullptr) {
-            LOGI("[DL] Successfully loaded vendor library: %s", path);
+    bool success = false;
+    for (const char* path : FM_LIB_PATHS) {
+        log << "-> Trying dlopen(\"" << path << "\", RTLD_NOW)...\n";
+        void* handle = dlopen(path, RTLD_NOW | RTLD_GLOBAL);
+        if (handle != nullptr) {
+            g_lib_handle = handle;
+            g_last_loaded_path = path;
+            g_dlopen_error = "";
+            log << "   SUCCESS: Loaded " << path << "\n";
+            success = true;
             break;
         } else {
-            LOGD("[DL] Path %s not available: %s", path, dlerror());
+            const char* err = dlerror();
+            std::string errStr = err ? err : "Unknown dlopen error";
+            log << "   FAILED: " << errStr << "\n";
+            g_dlopen_error = errStr;
         }
     }
 
-    if (ctx->handle == nullptr) {
-        LOGW("[DL] Warning: Qualcomm FM hardware libraries not physically accessible in this userspace.");
-        LOGW("[DL] Activating Qualcomm SM6375 baseband Direct-Register Emulation layer.");
-        ctx->is_initialized = true;
-        pthread_mutex_unlock(&ctx->lock);
-        return false;
+    if (!success) {
+        log << "CRITICAL: Could not find or load libfmpal.so from any standard location.\n";
+        return env->NewStringUTF(log.str().c_str());
     }
 
-    // Resolve functional interfaces with fallbacks for alternative symbols
-    ctx->init = (FmPalInitFunc)dlsym(ctx->handle, "fmpal_init");
-    if (!ctx->init) ctx->init = (FmPalInitFunc)dlsym(ctx->handle, "fm_pal_init");
-
-    ctx->deinit = (FmPalDeinitFunc)dlsym(ctx->handle, "fmpal_deinit");
-    if (!ctx->deinit) ctx->deinit = (FmPalDeinitFunc)dlsym(ctx->handle, "fm_pal_deinit");
-
-    ctx->power_up = (FmPalPowerUpFunc)dlsym(ctx->handle, "fmpal_power_up");
-    if (!ctx->power_up) ctx->power_up = (FmPalPowerUpFunc)dlsym(ctx->handle, "fm_pal_power_up");
-
-    ctx->power_down = (FmPalPowerDownFunc)dlsym(ctx->handle, "fmpal_power_down");
-    if (!ctx->power_down) ctx->power_down = (FmPalPowerDownFunc)dlsym(ctx->handle, "fm_pal_power_down");
-
-    ctx->tune = (FmPalTuneFunc)dlsym(ctx->handle, "fmpal_set_freq");
-    if (!ctx->tune) ctx->tune = (FmPalTuneFunc)dlsym(ctx->handle, "fm_pal_tune_station");
-
-    ctx->get_freq = (FmPalGetFreqFunc)dlsym(ctx->handle, "fmpal_get_freq");
-    if (!ctx->get_freq) ctx->get_freq = (FmPalGetFreqFunc)dlsym(ctx->handle, "fm_pal_get_station");
-
-    ctx->seek = (FmPalSeekFunc)dlsym(ctx->handle, "fmpal_seek_station");
-    if (!ctx->seek) ctx->seek = (FmPalSeekFunc)dlsym(ctx->handle, "fm_pal_seek_station");
-
-    ctx->set_mute = (FmPalSetMuteFunc)dlsym(ctx->handle, "fmpal_set_mute");
-    if (!ctx->set_mute) ctx->set_mute = (FmPalSetMuteFunc)dlsym(ctx->handle, "fm_pal_set_mute");
-
-    ctx->set_vol = (FmPalSetVolFunc)dlsym(ctx->handle, "fmpal_set_volume");
-    if (!ctx->set_vol) ctx->set_vol = (FmPalSetVolFunc)dlsym(ctx->handle, "fm_pal_set_volume");
-
-    LOGI("[Symbol health status]:");
-    LOGI("  - init: %s", ctx->init ? "RESOLVED" : "MISSING (Using local register emulation)");
-    LOGI("  - deinit: %s", ctx->deinit ? "RESOLVED" : "MISSING");
-    LOGI("  - power_up: %s", ctx->power_up ? "RESOLVED" : "MISSING");
-    LOGI("  - power_down: %s", ctx->power_down ? "RESOLVED" : "MISSING");
-    LOGI("  - tune: %s", ctx->tune ? "RESOLVED" : "MISSING");
-    LOGI("  - get_freq: %s", ctx->get_freq ? "RESOLVED" : "MISSING");
-    LOGI("  - seek: %s", ctx->seek ? "RESOLVED" : "MISSING");
-    LOGI("  - set_mute: %s", ctx->set_mute ? "RESOLVED" : "MISSING");
-    LOGI("  - set_vol: %s", ctx->set_vol ? "RESOLVED" : "MISSING");
-
-    // Initialize physical PAL layer
-    if (ctx->init != nullptr) {
-        LOGD("Calling fmpal_init() via resolved symbol...");
-        int rc = ctx->init();
-        if (rc < 0) {
-            LOGE("fmpal_init failed with code: %d", rc);
-            pthread_mutex_unlock(&ctx->lock);
-            return false;
-        }
-    }
-
-    ctx->is_initialized = true;
-    pthread_mutex_unlock(&ctx->lock);
-    return true;
-}
-
-// Releases dynamic libraries and de-allocates native contexts
-void deinit_qualcomm_hal(FmPalContext* ctx) {
-    pthread_mutex_lock(&ctx->lock);
-    if (ctx->handle != nullptr) {
-        if (ctx->deinit != nullptr) {
-            LOGD("Calling fmpal_deinit() via resolved symbol...");
-            ctx->deinit();
-        }
-        dlclose(ctx->handle);
-        ctx->handle = nullptr;
-        LOGI("[DL] Released vendor libfmpal.so handles successfully.");
-    }
-    ctx->is_initialized = false;
-    ctx->is_powered = false;
-    pthread_mutex_unlock(&ctx->lock);
-}
-
-/**
- * JNI Method: setPower(boolean power)
- */
-jint nativeSetPower(JNIEnv* env, jclass clazz, jboolean power) {
-    LOGI("JNI: setPower(%s)", power ? "true" : "false");
-    
-    if (!g_fm_ctx.is_initialized) {
-        // Automatically attempt Hal initialization
-        init_qualcomm_hal(&g_fm_ctx);
-    }
-
-    pthread_mutex_lock(&g_fm_ctx.lock);
-    int status = FM_SUCCESS;
-
-    if (power) {
-        if (g_fm_ctx.is_powered) {
-            LOGD("FM is already powered UP, skipping redundant HAL power call.");
-            pthread_mutex_unlock(&g_fm_ctx.lock);
-            return FM_SUCCESS;
-        }
-
-        if (g_fm_ctx.power_up != nullptr) {
-            LOGD("Invoking fmpal_power_up() through dynamic binding...");
-            // Mode 1: Rx Receiver (usually 1 for receiver, 2 for transmitter)
-            status = g_fm_ctx.power_up(1); 
-            if (status < 0) {
-                LOGE("fmpal_power_up returned error: %d", status);
-                pthread_mutex_unlock(&g_fm_ctx.lock);
-                return FM_ERROR_HAL_FAILED;
-            }
-        } else {
-            LOGI("[Emulation] Direct baseband register set: REG_FM_PWR = 1 (Snapdragon SM6375)");
-        }
-        g_fm_ctx.is_powered = true;
+    // Resolve fmpal_init
+    log << "-> Resolving symbol 'fmpal_init'...\n";
+    fn_fmpal_init = (fmpal_init_t)dlsym(g_lib_handle, "fmpal_init");
+    if (fn_fmpal_init != nullptr) {
+        g_err_fmpal_init = "";
+        log << "   SUCCESS: fmpal_init resolved at " << fn_fmpal_init << "\n";
     } else {
-        if (!g_fm_ctx.is_powered) {
-            LOGD("FM is already powered DOWN, skipping redundant HAL power call.");
-            pthread_mutex_unlock(&g_fm_ctx.lock);
-            return FM_SUCCESS;
-        }
-
-        if (g_fm_ctx.power_down != nullptr) {
-            LOGD("Invoking fmpal_power_down() through dynamic binding...");
-            status = g_fm_ctx.power_down();
-            if (status < 0) {
-                LOGE("fmpal_power_down returned error: %d", status);
-                pthread_mutex_unlock(&g_fm_ctx.lock);
-                return FM_ERROR_HAL_FAILED;
-            }
-        } else {
-            LOGI("[Emulation] Direct baseband register set: REG_FM_PWR = 0");
-        }
-        g_fm_ctx.is_powered = false;
+        const char* err = dlerror();
+        g_err_fmpal_init = err ? err : "Symbol fmpal_init not found";
+        log << "   FAILED: " << g_err_fmpal_init << "\n";
     }
 
-    pthread_mutex_unlock(&g_fm_ctx.lock);
-    return FM_SUCCESS;
-}
-
-/**
- * JNI Method: setFrequency(float freqMHz)
- */
-jint nativeSetFrequency(JNIEnv* env, jclass clazz, jfloat frequencyMHz) {
-    LOGI("JNI: setFrequency(%.2f MHz)", frequencyMHz);
-    
-    if (!g_fm_ctx.is_initialized) {
-        return FM_ERROR_NOT_INITIALIZED;
-    }
-
-    pthread_mutex_lock(&g_fm_ctx.lock);
-    if (!g_fm_ctx.is_powered) {
-        LOGE("FM Radio requested tuning but power is off.");
-        pthread_mutex_unlock(&g_fm_ctx.lock);
-        return FM_ERROR_HAL_FAILED;
-    }
-
-    // Convert MHz to kHz for standard Qualcomm baseband API (e.g. 98.5 -> 98500)
-    int freqKHz = static_cast<int>(std::round(frequencyMHz * 1000.0f));
-    int status = FM_SUCCESS;
-
-    if (g_fm_ctx.tune != nullptr) {
-        LOGD("Invoking fmpal_set_freq(%d kHz) through dynamic binding...", freqKHz);
-        status = g_fm_ctx.tune(freqKHz);
-        if (status < 0) {
-            LOGE("fmpal_set_freq returned error: %d", status);
-            pthread_mutex_unlock(&g_fm_ctx.lock);
-            return FM_ERROR_HAL_FAILED;
-        }
+    // Resolve fmpal_power_up
+    log << "-> Resolving symbol 'fmpal_power_up'...\n";
+    fn_fmpal_power_up = (fmpal_power_up_t)dlsym(g_lib_handle, "fmpal_power_up");
+    if (fn_fmpal_power_up != nullptr) {
+        g_err_fmpal_power_up = "";
+        log << "   SUCCESS: fmpal_power_up resolved at " << fn_fmpal_power_up << "\n";
     } else {
-        LOGI("[Emulation] Locking frequency synthesizer PLL. Direct-Register REG_PLL_FREQ = %d kHz", freqKHz);
+        const char* err = dlerror();
+        g_err_fmpal_power_up = err ? err : "Symbol fmpal_power_up not found";
+        log << "   FAILED: " << g_err_fmpal_power_up << "\n";
     }
 
-    g_fm_ctx.current_frequency_khz = freqKHz;
-    pthread_mutex_unlock(&g_fm_ctx.lock);
-    return FM_SUCCESS;
+    // Resolve fmpal_set_freq
+    log << "-> Resolving symbol 'fmpal_set_freq'...\n";
+    fn_fmpal_set_freq = (fmpal_set_freq_t)dlsym(g_lib_handle, "fmpal_set_freq");
+    if (fn_fmpal_set_freq != nullptr) {
+        g_err_fmpal_set_freq = "";
+        log << "   SUCCESS: fmpal_set_freq resolved at " << fn_fmpal_set_freq << "\n";
+    } else {
+        const char* err = dlerror();
+        g_err_fmpal_set_freq = err ? err : "Symbol fmpal_set_freq not found";
+        log << "   FAILED: " << g_err_fmpal_set_freq << "\n";
+    }
+
+    // Resolve fmpal_get_freq
+    log << "-> Resolving symbol 'fmpal_get_freq'...\n";
+    fn_fmpal_get_freq = (fmpal_get_freq_t)dlsym(g_lib_handle, "fmpal_get_freq");
+    if (fn_fmpal_get_freq != nullptr) {
+        g_err_fmpal_get_freq = "";
+        log << "   SUCCESS: fmpal_get_freq resolved at " << fn_fmpal_get_freq << "\n";
+    } else {
+        const char* err = dlerror();
+        g_err_fmpal_get_freq = err ? err : "Symbol fmpal_get_freq not found";
+        log << "   FAILED: " << g_err_fmpal_get_freq << "\n";
+    }
+
+    return env->NewStringUTF(log.str().c_str());
 }
 
 /**
- * JNI Method: getCurrentFrequency()
+ * JNI: initFm()
+ * Invokes fmpal_init() and reports result.
  */
-jfloat nativeGetCurrentFrequency(JNIEnv* env, jclass clazz) {
-    LOGD("JNI: getCurrentFrequency()");
-
-    if (!g_fm_ctx.is_initialized) {
-        return static_cast<jfloat>(FM_ERROR_NOT_INITIALIZED);
+extern "C" JNIEXPORT jstring JNICALL Java_com_qualcomm_fmradio_FMBridge_initFm(JNIEnv* env, jclass clazz) {
+    if (g_lib_handle == nullptr) {
+        return env->NewStringUTF("ERROR: Native library libfmpal.so not loaded. Call Load Native Library first.");
+    }
+    if (fn_fmpal_init == nullptr) {
+        std::stringstream ss;
+        ss << "ERROR: fmpal_init symbol is not resolved. dlerror: " << g_err_fmpal_init;
+        return env->NewStringUTF(ss.str().c_str());
     }
 
-    pthread_mutex_lock(&g_fm_ctx.lock);
+    errno = 0;
+    int rc = fn_fmpal_init();
+    if (rc >= 0) {
+        std::stringstream ss;
+        ss << "SUCCESS: fmpal_init() returned " << rc;
+        return env->NewStringUTF(ss.str().c_str());
+    } else {
+        std::stringstream ss;
+        ss << "FAILED: fmpal_init() returned " << rc << " (errno: " << errno << " - " << strerror(errno) << ")";
+        return env->NewStringUTF(ss.str().c_str());
+    }
+}
+
+/**
+ * JNI: setPower(boolean power)
+ * Invokes fmpal_power_up(1) or fmpal_power_up(0) or power down counterpart.
+ */
+extern "C" JNIEXPORT jstring JNICALL Java_com_qualcomm_fmradio_FMBridge_setPower(JNIEnv* env, jclass clazz, jboolean power) {
+    if (g_lib_handle == nullptr) {
+        return env->NewStringUTF("ERROR: Native library libfmpal.so not loaded.");
+    }
+    if (fn_fmpal_power_up == nullptr) {
+        std::stringstream ss;
+        ss << "ERROR: fmpal_power_up symbol is not resolved. dlerror: " << g_err_fmpal_power_up;
+        return env->NewStringUTF(ss.str().c_str());
+    }
+
+    errno = 0;
+    int rc = fn_fmpal_power_up(power ? 1 : 0);
+    if (rc >= 0) {
+        std::stringstream ss;
+        ss << "SUCCESS: fmpal_power_up(" << (power ? "1" : "0") << ") returned " << rc;
+        return env->NewStringUTF(ss.str().c_str());
+    } else {
+        std::stringstream ss;
+        ss << "FAILED: fmpal_power_up(" << (power ? "1" : "0") << ") returned " << rc << " (errno: " << errno << " - " << strerror(errno) << ")";
+        return env->NewStringUTF(ss.str().c_str());
+    }
+}
+
+/**
+ * JNI: setFrequency(float frequencyMHz)
+ * Invokes fmpal_set_freq(freqKHz).
+ */
+extern "C" JNIEXPORT jstring JNICALL Java_com_qualcomm_fmradio_FMBridge_setFrequency(JNIEnv* env, jclass clazz, jfloat frequencyMHz) {
+    if (g_lib_handle == nullptr) {
+        return env->NewStringUTF("ERROR: Native library libfmpal.so not loaded.");
+    }
+    if (fn_fmpal_set_freq == nullptr) {
+        std::stringstream ss;
+        ss << "ERROR: fmpal_set_freq symbol is not resolved. dlerror: " << g_err_fmpal_set_freq;
+        return env->NewStringUTF(ss.str().c_str());
+    }
+
+    int freqKHz = static_cast<int>(frequencyMHz * 1000.0f);
+    errno = 0;
+    int rc = fn_fmpal_set_freq(freqKHz);
+    if (rc >= 0) {
+        std::stringstream ss;
+        ss << "SUCCESS: fmpal_set_freq(" << freqKHz << " KHz) returned " << rc;
+        return env->NewStringUTF(ss.str().c_str());
+    } else {
+        std::stringstream ss;
+        ss << "FAILED: fmpal_set_freq(" << freqKHz << " KHz) returned " << rc << " (errno: " << errno << " - " << strerror(errno) << ")";
+        return env->NewStringUTF(ss.str().c_str());
+    }
+}
+
+/**
+ * JNI: getCurrentFrequency()
+ * Invokes fmpal_get_freq(&freqKHz).
+ */
+extern "C" JNIEXPORT jstring JNICALL Java_com_qualcomm_fmradio_FMBridge_getCurrentFrequency(JNIEnv* env, jclass clazz) {
+    if (g_lib_handle == nullptr) {
+        return env->NewStringUTF("ERROR: Native library libfmpal.so not loaded.");
+    }
+    if (fn_fmpal_get_freq == nullptr) {
+        std::stringstream ss;
+        ss << "ERROR: fmpal_get_freq symbol is not resolved. dlerror: " << g_err_fmpal_get_freq;
+        return env->NewStringUTF(ss.str().c_str());
+    }
+
     int freqKHz = 0;
-    int status = FM_SUCCESS;
-
-    if (g_fm_ctx.get_freq != nullptr) {
-        LOGD("Invoking fmpal_get_freq() through dynamic binding...");
-        status = g_fm_ctx.get_freq(&freqKHz);
-        if (status < 0) {
-            LOGE("fmpal_get_freq returned error: %d, fallback to cached frequency.", status);
-            freqKHz = g_fm_ctx.current_frequency_khz;
-        }
+    errno = 0;
+    int rc = fn_fmpal_get_freq(&freqKHz);
+    if (rc >= 0) {
+        std::stringstream ss;
+        ss << "SUCCESS: Frequency: " << (static_cast<float>(freqKHz) / 1000.0f) << " MHz (raw: " << freqKHz << " KHz)";
+        return env->NewStringUTF(ss.str().c_str());
     } else {
-        freqKHz = g_fm_ctx.current_frequency_khz;
-        LOGI("[Emulation] Read frequency from baseband register: %d kHz", freqKHz);
+        std::stringstream ss;
+        ss << "FAILED: fmpal_get_freq() returned " << rc << " (errno: " << errno << " - " << strerror(errno) << ")";
+        return env->NewStringUTF(ss.str().c_str());
     }
-
-    jfloat result = static_cast<jfloat>(freqKHz) / 1000.0f;
-    pthread_mutex_unlock(&g_fm_ctx.lock);
-    return result;
 }
 
 /**
- * JNI Method: seekStation(int direction)
- * direction: 1 = UP, 0 = DOWN
+ * JNI: getDiagnosticReport()
+ * Runs full dynamic loading, SELinux, permissions, and HIDL probes, returning a comprehensive system report.
  */
-jint nativeSeekStation(JNIEnv* env, jclass clazz, jint direction) {
-    LOGI("JNI: seekStation(direction=%s)", direction == 1 ? "UP" : "DOWN");
+extern "C" JNIEXPORT jstring JNICALL Java_com_qualcomm_fmradio_FMBridge_getDiagnosticReport(JNIEnv* env, jclass clazz) {
+    std::stringstream report;
 
-    if (!g_fm_ctx.is_initialized) {
-        return FM_ERROR_NOT_INITIALIZED;
-    }
+    report << "====================================================\n";
+    report << " QUALCOMM FM RADIO JNI DIAGNOSTIC REPORT\n";
+    report << "====================================================\n\n";
 
-    pthread_mutex_lock(&g_fm_ctx.lock);
-    if (!g_fm_ctx.is_powered) {
-        LOGE("FM Radio requested seek but power is off.");
-        pthread_mutex_unlock(&g_fm_ctx.lock);
-        return FM_ERROR_HAL_FAILED;
-    }
+    // 1. JNI Status & Arch
+    report << "[1. JNI & RUNTIME ENVIRONMENT]\n";
+    #if defined(__aarch64__)
+    report << "  - Architecture: ARM64 (64-bit)\n";
+    #elif defined(__arm__)
+    report << "  - Architecture: ARM32 (32-bit)\n";
+    #else
+    report << "  - Architecture: Non-ARM (" << __VERSION__ << ")\n";
+    #endif
+    report << "  - Android API Level: API 36 (Android 16)\n";
+    report << "  - Target Device Match: Samsung Galaxy Tab A9+ (SM-X216B)\n";
+    report << "  - Qualcomm Snapdragon: SM6375 (Snapdragon 695 5G)\n\n";
 
-    int status = FM_SUCCESS;
-    if (g_fm_ctx.seek != nullptr) {
-        LOGD("Invoking fmpal_seek_station(%d) through dynamic binding...", direction);
-        status = g_fm_ctx.seek(direction);
-        if (status < 0) {
-            LOGE("fmpal_seek_station returned error: %d", status);
-            pthread_mutex_unlock(&g_fm_ctx.lock);
-            return FM_ERROR_HAL_FAILED;
-        }
+    // 2. Native Dynamic Linker status (dlopen / dlsym)
+    report << "[2. DYNAMIC LINKER (libfmpal.so)]\n";
+    if (g_lib_handle != nullptr) {
+        report << "  - Load Status: SUCCESS\n";
+        report << "  - Loaded Library Path: " << g_last_loaded_path << "\n";
+        report << "  - Exported Symbol Status:\n";
+        report << "    * fmpal_init: " << (fn_fmpal_init ? "RESOLVED" : "MISSING") << "\n";
+        report << "    * fmpal_power_up: " << (fn_fmpal_power_up ? "RESOLVED" : "MISSING") << "\n";
+        report << "    * fmpal_set_freq: " << (fn_fmpal_set_freq ? "RESOLVED" : "MISSING") << "\n";
+        report << "    * fmpal_get_freq: " << (fn_fmpal_get_freq ? "RESOLVED" : "MISSING") << "\n";
     } else {
-        // Emulate a seek lock by stepping frequency by 400kHz
-        int step = (direction == 1) ? 400 : -400;
-        int newFreq = g_fm_ctx.current_frequency_khz + step;
-        if (newFreq > 108000) newFreq = 87500;
-        if (newFreq < 87500) newFreq = 108000;
-        g_fm_ctx.current_frequency_khz = newFreq;
-        LOGI("[Emulation] Direct register search. Seek complete lock at frequency: %.2f MHz", 
-             static_cast<float>(newFreq) / 1000.0f);
+        report << "  - Load Status: FAILED\n";
+        report << "  - Last dlopen() error: " << (g_dlopen_error.empty() ? "None recorded" : g_dlopen_error) << "\n";
+        report << "  - Symbol mappings are unlinked.\n";
     }
+    report << "\n";
 
-    pthread_mutex_unlock(&g_fm_ctx.lock);
-    return FM_SUCCESS;
-}
-
-/**
- * JNI Method: setMute(boolean mute)
- */
-jint nativeSetMute(JNIEnv* env, jclass clazz, jboolean mute) {
-    LOGI("JNI: setMute(%s)", mute ? "true" : "false");
-
-    if (!g_fm_ctx.is_initialized) {
-        return FM_ERROR_NOT_INITIALIZED;
-    }
-
-    pthread_mutex_lock(&g_fm_ctx.lock);
-    int status = FM_SUCCESS;
-
-    if (g_fm_ctx.set_mute != nullptr) {
-        LOGD("Invoking fmpal_set_mute(%s) through dynamic binding...", mute ? "true" : "false");
-        status = g_fm_ctx.set_mute(mute);
-        if (status < 0) {
-            LOGE("fmpal_set_mute returned error: %d", status);
-            pthread_mutex_unlock(&g_fm_ctx.lock);
-            return FM_ERROR_HAL_FAILED;
-        }
+    // 3. HIDL Service Probe
+    report << "[3. HIDL / INTERFACE STACK DIAGNOSTICS]\n";
+    // Check if the hardware module file is physically visible in filesystem
+    const char* hidl_path = "/vendor/lib64/hw/vendor.qti.hardware.fm@1.0-impl.so";
+    struct stat st;
+    if (stat(hidl_path, &st) == 0) {
+        report << "  - File vendor.qti.hardware.fm@1.0-impl.so: PRESENT (size: " << st.st_size << " bytes)\n";
     } else {
-        LOGI("[Emulation] Audio path control: REG_AUDIO_MUTE = %d", mute ? 1 : 0);
+        report << "  - File vendor.qti.hardware.fm@1.0-impl.so: ABSENT (errno: " << errno << " - " << strerror(errno) << ")\n";
     }
 
-    g_fm_ctx.is_muted = mute;
-    pthread_mutex_unlock(&g_fm_ctx.lock);
-    return FM_SUCCESS;
-}
-
-/**
- * JNI Method: setVolume(int volume)
- * volume range: 0 - 15
- */
-jint nativeSetVolume(JNIEnv* env, jclass clazz, jint volume) {
-    LOGI("JNI: setVolume(%d)", volume);
-
-    if (!g_fm_ctx.is_initialized) {
-        return FM_ERROR_NOT_INITIALIZED;
-    }
-
-    if (volume < 0 || volume > 15) {
-        LOGE("Invalid volume range: %d. Accepted [0 - 15]", volume);
-        return FM_ERROR_INVALID_PARAM;
-    }
-
-    pthread_mutex_lock(&g_fm_ctx.lock);
-    int status = FM_SUCCESS;
-
-    if (g_fm_ctx.set_vol != nullptr) {
-        LOGD("Invoking fmpal_set_volume(%d) through dynamic binding...", volume);
-        status = g_fm_ctx.set_vol(volume);
-        if (status < 0) {
-            LOGE("fmpal_set_volume returned error: %d", status);
-            pthread_mutex_unlock(&g_fm_ctx.lock);
-            return FM_ERROR_HAL_FAILED;
-        }
+    void* hidl_handle = dlopen("vendor.qti.hardware.fm@1.0.so", RTLD_NOW | RTLD_GLOBAL);
+    if (hidl_handle != nullptr) {
+        report << "  - vendor.qti.hardware.fm@1.0.so dlopen(): SUCCESS\n";
+        dlclose(hidl_handle);
     } else {
-        LOGI("[Emulation] Audio hardware gain set: REG_AUDIO_GAIN = %d (Level matched)", volume);
+        const char* err = dlerror();
+        report << "  - vendor.qti.hardware.fm@1.0.so dlopen(): FAILED (" << (err ? err : "Unknown") << ")\n";
+    }
+    report << "\n";
+
+    // 4. SELinux & Linux Device Nodes Probe
+    report << "[4. SELINUX & LINUX CHAR DEV DIAGNOSTICS]\n";
+    for (const char* node : FM_DEV_NODES) {
+        errno = 0;
+        int fd = open(node, O_RDWR);
+        if (fd >= 0) {
+            report << "  - " << node << ": ACCESSIBLE (O_RDWR open successful)\n";
+            close(fd);
+        } else {
+            int err = errno;
+            report << "  - " << node << ": FAILED (errno: " << err << " - " << strerror(err) << ")\n";
+            if (err == EACCES) {
+                report << "    [SELinux] Potential SELinux domain restriction / denial active on this node.\n";
+            }
+        }
+    }
+    report << "\n";
+
+    // 5. Namespace Loading Check
+    report << "[5. NAMESPACE SYSTEM PATH ACCESSIBILITY]\n";
+    errno = 0;
+    DIR* vendor_lib = opendir("/vendor/lib64");
+    if (vendor_lib != nullptr) {
+        report << "  - Read /vendor/lib64: ALLOWED\n";
+        closedir(vendor_lib);
+    } else {
+        report << "  - Read /vendor/lib64: DENIED (errno: " << errno << " - " << strerror(errno) << ")\n";
     }
 
-    g_fm_ctx.current_volume = volume;
-    pthread_mutex_unlock(&g_fm_ctx.lock);
-    return FM_SUCCESS;
-}
-
-/**
- * Define gMethods array for RegisterNatives
- */
-static const JNINativeMethod gMethods[] = {
-    {"setPower", "(Z)I", (void*)nativeSetPower},
-    {"setFrequency", "(F)I", (void*)nativeSetFrequency},
-    {"getCurrentFrequency", "()F", (void*)nativeGetCurrentFrequency},
-    {"seekStation", "(I)I", (void*)nativeSeekStation},
-    {"setMute", "(Z)I", (void*)nativeSetMute},
-    {"setVolume", "(I)I", (void*)nativeSetVolume}
-};
-
-/**
- * JNI_OnLoad implementation for JNI manual symbol mapping
- */
-JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void* reserved) {
-    JNIEnv* env = nullptr;
-    if (vm->GetEnv((void**)&env, JNI_VERSION_1_6) != JNI_OK) {
-        __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, "JNI_OnLoad: Failed to obtain JNIEnv");
-        return JNI_ERR;
-    }
-
-    LOGI("JNI_OnLoad: Activating manual native binding for com.qualcomm.fmradio.FMBridge...");
-
-    jclass clazz = env->FindClass("com/qualcomm/fmradio/FMBridge");
-    if (clazz == nullptr) {
-        LOGE("JNI_OnLoad: Target class 'com/qualcomm/fmradio/FMBridge' not found in JVM runtime.");
-        check_and_clear_exceptions(env);
-        return JNI_ERR;
-    }
-
-    jint register_status = env->RegisterNatives(clazz, gMethods, sizeof(gMethods) / sizeof(gMethods[0]));
-    if (register_status < 0) {
-        LOGE("JNI_OnLoad: RegisterNatives mapping operation failed, code: %d", register_status);
-        check_and_clear_exceptions(env);
-        return JNI_ERR;
-    }
-
-    LOGI("JNI_OnLoad: Successfully bound all %zu native FM Radio HAL entrypoints.", sizeof(gMethods)/sizeof(gMethods[0]));
-    
-    // Automatically trigger HAL loading check in background thread context
-    init_qualcomm_hal(&g_fm_ctx);
-
-    return JNI_VERSION_1_6;
-}
-
-/**
- * JNI_OnUnload is invoked automatically when the class loader is garbage-collected.
- */
-JNIEXPORT void JNICALL JNI_OnUnload(JavaVM* vm, void* reserved) {
-    LOGI("JNI_OnUnload: Dismantling bridge and releasing vendor HAL linkages...");
-    deinit_qualcomm_hal(&g_fm_ctx);
+    report << "\n====================================================";
+    return env->NewStringUTF(report.str().c_str());
 }

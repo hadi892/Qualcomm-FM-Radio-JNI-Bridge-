@@ -6,254 +6,126 @@
 package com.qualcomm.fmradio
 
 import android.content.Context
+import android.content.pm.PackageManager
 import android.util.Log
 
 /**
- * Production-grade API Manager for Qualcomm Snapdragon FM Radio receiver hardware.
- * 
- * Provides safe, thread-safe access, robust validations, and maps lower-level native JNI
- * errors into clean Kotlin runtime exceptions.
+ * Thread-safe API manager that wraps lower-level FMBridge JNI invocations
+ * and exposes clean diagnostics and states for MainActivity.
  */
 class FMManager(private val context: Context) {
 
     companion object {
         private const val TAG = "QualcommFM_Manager"
-
-        // Native bridge error codes
-        const val FM_SUCCESS = 0
-        const val FM_ERROR_UNSUPPORTED = -1
-        const val FM_ERROR_HAL_FAILED = -2
-        const val FM_ERROR_NOT_INITIALIZED = -3
-        const val FM_ERROR_INVALID_PARAM = -4
-        const val FM_ERROR_PERMISSION_DENIED = -5
     }
 
     private val stateLock = Any()
-    private var isPoweredOn = false
-    private var currentFrequency = 98.5f
-    private var isMuted = false
-    private var currentVolume = 10
+    
+    // In-memory cache of current hardware states (updated during JNI calls)
+    var isJniLoaded = false
+        private set
+    var isFmInitialized = false
+        private set
+    var isPoweredOn = false
+        private set
+    var currentFrequencyMHz = 101.9f
+        private set
 
     /**
-     * Powers UP the Qualcomm Snapdragon FM Radio module.
-     * Initializes the underlying vendor.qti.hardware.fm HAL service.
-     * 
-     * @return True if power-up succeeded.
-     * @throws RuntimeException If the hardware or HAL reports a critical launch error.
+     * Executes native load diagnostics.
      */
-    fun powerUp(): Boolean {
+    fun loadNativeLibrary(): String {
         synchronized(stateLock) {
-            Log.d(TAG, "Requesting FM Radio hardware power-up...")
-            
-            // Check custom hardware permissions
-            if (!hasFmHardwarePermission()) {
-                throw SecurityException("App does not have access rights to Qualcomm vendor HAL socket nodes.")
+            Log.d(TAG, "Invoking low-level JNI dlopen/dlsym sequence...")
+            val result = FMBridge.loadNativeLibrary()
+            if (result.contains("SUCCESS: Loaded")) {
+                isJniLoaded = true
             }
-
-            val result = FMBridge.setPower(true)
-            if (result == FM_SUCCESS) {
-                isPoweredOn = true
-                Log.i(TAG, "FM Radio is powered UP and locked to active baseband PLL.")
-                return true
-            } else {
-                handleNativeError("Power Up", result)
-                return false
-            }
+            return result
         }
     }
 
     /**
-     * Powers DOWN the FM module to minimize SoC battery consumption.
+     * Executes native fmpal_init.
      */
-    fun powerDown(): Boolean {
+    fun initFm(): String {
         synchronized(stateLock) {
-            Log.d(TAG, "Requesting FM Radio hardware power-down...")
-            val result = FMBridge.setPower(false)
-            if (result == FM_SUCCESS) {
-                isPoweredOn = false
-                Log.i(TAG, "FM Radio successfully powered DOWN. Baseband in sleep state.")
-                return true
-            } else {
-                handleNativeError("Power Down", result)
-                return false
+            Log.d(TAG, "Invoking native fmpal_init()...")
+            val result = FMBridge.initFm()
+            if (result.contains("SUCCESS:")) {
+                isFmInitialized = true
             }
+            return result
         }
     }
 
     /**
-     * Checks if the FM radio is currently powered on.
+     * Executes native fmpal_power_up.
      */
-    fun isPoweredOn(): Boolean {
+    fun setPower(power: Boolean): String {
         synchronized(stateLock) {
-            return isPoweredOn
+            Log.d(TAG, "Invoking native fmpal_power_up($power)...")
+            val result = FMBridge.setPower(power)
+            if (result.contains("SUCCESS:")) {
+                isPoweredOn = power
+            }
+            return result
         }
     }
 
     /**
-     * Tunes to a specific frequency.
-     * 
-     * @param frequencyMHz Target FM frequency (e.g., 94.1f). Supported band: [76.0 - 108.0 MHz].
-     * @return True if tuned successfully.
-     * @throws IllegalStateException If the tuner is currently powered down.
-     * @throws IllegalArgumentException If frequency lies outside standard international bands.
+     * Executes native fmpal_set_freq.
      */
-    fun setFrequency(frequencyMHz: Float): Boolean {
+    fun setFrequency(frequencyMHz: Float): String {
         synchronized(stateLock) {
-            if (!isPoweredOn) {
-                throw IllegalStateException("Cannot set frequency: Qualcomm FM Tuner is powered down.")
-            }
-            if (frequencyMHz < 76.0f || frequencyMHz > 108.0f) {
-                throw IllegalArgumentException("Invalid frequency: $frequencyMHz MHz. Supported band: 76.0 - 108.0 MHz.")
-            }
-
-            Log.d(TAG, "Tuning baseband to: $frequencyMHz MHz")
+            Log.d(TAG, "Invoking native fmpal_set_freq($frequencyMHz)...")
             val result = FMBridge.setFrequency(frequencyMHz)
-            if (result == FM_SUCCESS) {
-                currentFrequency = frequencyMHz
-                Log.i(TAG, "Tuned and locked to $frequencyMHz MHz successfully.")
-                return true
-            } else {
-                handleNativeError("Tune frequency ($frequencyMHz)", result)
-                return false
+            if (result.contains("SUCCESS:")) {
+                currentFrequencyMHz = frequencyMHz
             }
+            return result
         }
     }
 
     /**
-     * Reads active tuned frequency directly from hardware register PLL locks.
-     * 
-     * @return Active tuned frequency in MHz.
+     * Executes native fmpal_get_freq.
      */
-    fun getCurrentFrequency(): Float {
+    fun getCurrentFrequency(): String {
         synchronized(stateLock) {
-            if (!isPoweredOn) {
-                Log.w(TAG, "Tuner is powered off; returning cached last-known frequency.")
-                return currentFrequency
-            }
-
-            val freq = FMBridge.getCurrentFrequency()
-            if (freq < 0.0f) {
-                Log.w(TAG, "Failed to read physical PLL; returning cached value. Error code: $freq")
-                return currentFrequency
-            }
-            currentFrequency = freq
-            return freq
-        }
-    }
-
-    /**
-     * Triggers active hardware automatic search (seek) for clear broadcast stations.
-     * 
-     * @param upward True to sweep upwards (98.5 -> 98.9...), false to sweep downwards.
-     * @return True if a search lock has been successfully initiated.
-     */
-    fun seek(upward: Boolean): Boolean {
-        synchronized(stateLock) {
-            if (!isPoweredOn) {
-                throw IllegalStateException("Cannot seek: Qualcomm FM Tuner is powered down.")
-            }
-
-            val direction = if (upward) 1 else 0
-            Log.d(TAG, "Triggering automatic broadcast search. Direction: ${if (upward) "UP" else "DOWN"}")
-            val result = FMBridge.seekStation(direction)
-            if (result == FM_SUCCESS) {
-                // Update frequency cache as seek changes frequency inside hardware registers
-                val updatedFreq = FMBridge.getCurrentFrequency()
-                if (updatedFreq > 76.0f) {
-                    currentFrequency = updatedFreq
+            Log.d(TAG, "Invoking native fmpal_get_freq()...")
+            val result = FMBridge.getCurrentFrequency()
+            // Try to extract frequency from JNI success message (e.g., "SUCCESS: Frequency: 101.9 MHz")
+            if (result.contains("SUCCESS: Frequency:")) {
+                try {
+                    val parts = result.split(" ")
+                    for (i in parts.indices) {
+                        if (parts[i] == "Frequency:" && i + 1 < parts.size) {
+                            currentFrequencyMHz = parts[i + 1].toFloat()
+                            break
+                        }
+                    }
+                } catch (e: Exception) {
+                    Log.w(TAG, "Failed to parse frequency from JNI result string: ${e.message}")
                 }
-                Log.i(TAG, "Auto-seek succeeded. Tuned station locked.")
-                return true
-            } else {
-                handleNativeError("Auto-Seek", result)
-                return false
             }
+            return result
         }
     }
 
     /**
-     * Mutes or unmutes the active analog/digital FM audio path.
-     * 
-     * @param mute True to silence output, false to restore volume.
+     * Returns a full, deep diagnostic probe of dynamic linking, SELinux, permissions, and HIDL.
      */
-    fun setMute(mute: Boolean): Boolean {
+    fun getDiagnosticReport(): String {
         synchronized(stateLock) {
-            if (!isPoweredOn) {
-                throw IllegalStateException("Cannot mute: Qualcomm FM Tuner is powered down.")
-            }
-
-            val result = FMBridge.setMute(mute)
-            if (result == FM_SUCCESS) {
-                isMuted = mute
-                Log.i(TAG, "Audio output mute state set: $mute")
-                return true
-            } else {
-                handleNativeError("Set Mute", result)
-                return false
-            }
+            Log.d(TAG, "Generating live native diagnostic report...")
+            return FMBridge.getDiagnosticReport()
         }
     }
 
     /**
-     * Checks if the FM audio output is currently muted.
+     * Verifies if the app possesses target hardware execution permissions.
      */
-    fun isMuted(): Boolean = synchronized(stateLock) { isMuted }
-
-    /**
-     * Configures the master gain volume step inside the FM chip.
-     * 
-     * @param volume Target gain step in range [0 - 15].
-     */
-    fun setVolume(volume: Int): Boolean {
-        synchronized(stateLock) {
-            if (!isPoweredOn) {
-                throw IllegalStateException("Cannot adjust volume: Qualcomm FM Tuner is powered down.")
-            }
-            if (volume < 0 || volume > 15) {
-                throw IllegalArgumentException("Invalid volume step: $volume. Range is [0 - 15].")
-            }
-
-            val result = FMBridge.setVolume(volume)
-            if (result == FM_SUCCESS) {
-                currentVolume = volume
-                Log.i(TAG, "Tuner digital gain volume adjusted: $volume")
-                return true
-            } else {
-                handleNativeError("Set Volume", result)
-                return false
-            }
-        }
-    }
-
-    /**
-     * Reads cached volume index.
-     */
-    fun getVolume(): Int = synchronized(stateLock) { currentVolume }
-
-    /**
-     * Real-time validation for system hardware-level access credentials.
-     */
-    private fun hasFmHardwarePermission(): Boolean {
-        // Since Qualcomm FM runs under system/vendor space, standard client apps need
-        // ACCESS_FM_RADIO system permission or runs under privileged BSP context.
-        val hasPermission = context.checkSelfPermission("android.permission.ACCESS_FM_RADIO")
-        return hasPermission == android.content.pm.PackageManager.PERMISSION_GRANTED
-    }
-
-    /**
-     * Translates native C++ dynamic linker & HAL return codes into helpful structured runtime exceptions.
-     */
-    private fun handleNativeError(operation: String, errorCode: Int) {
-        val detail = when (errorCode) {
-            FM_ERROR_UNSUPPORTED -> "Dynamic linking failed: hardware configuration unsupported."
-            FM_ERROR_HAL_FAILED -> "Qualcomm Snapdragon baseband driver/binder interface returned a critical failure."
-            FM_ERROR_NOT_INITIALIZED -> "Tuner PAL layers not properly bound or initialized."
-            FM_ERROR_INVALID_PARAM -> "Invalid parameter value passed across JNI boundary."
-            FM_ERROR_PERMISSION_DENIED -> "Permissions denied inside SELinux vendor context rules."
-            else -> "Unclassified hardware error ($errorCode)."
-        }
-        val msg = "Qualcomm FM Radio error during '$operation': $detail"
-        Log.e(TAG, msg)
-        throw RuntimeException(msg)
+    fun hasFmPermission(): Boolean {
+        return context.checkSelfPermission("android.permission.ACCESS_FM_RADIO") == PackageManager.PERMISSION_GRANTED
     }
 }
