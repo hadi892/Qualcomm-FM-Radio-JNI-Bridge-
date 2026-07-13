@@ -1,0 +1,6 @@
+{
+  "name": "Qualcomm FM Radio JNI Bridge",
+  "description": "Interactive developer workspace, JNI code explorer, and reverse-engineering guide for building real Qualcomm FM Radio platform bridges on SM-X216B (Snapdragon 695).",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

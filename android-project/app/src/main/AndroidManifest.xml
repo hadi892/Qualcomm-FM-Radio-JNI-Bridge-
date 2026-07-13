@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  ~ @license
+  ~ SPDX-License-Identifier: Apache-2.0
+-->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="com.qualcomm.fmradio">
+
+    <!-- Qualcomm Platform & BSP Radio Hardware Access Permission -->
+    <uses-permission android:name="android.permission.ACCESS_FM_RADIO" />
+
+    <!-- Required for routing high-fidelity analog FM signals through the device's Audio HAL -->
+    <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
+
+    <!-- Required to maintain FM background audio playback when the display is sleeping -->
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+
+    <!-- Optional: Required if the application captures FM audio streams into recordings -->
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+
+    <application
+        android:allowBackup="true"
+        android:label="Qualcomm Snapdragon FM Radio JNI"
+        android:theme="@android:style/Theme.DeviceDefault.NoActionBar">
+
+        <!-- Low-level services can be declared here if needed -->
+        
+    </application>
+</manifest>
