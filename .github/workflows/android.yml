@@ -68,8 +68,7 @@ jobs:
       with:
         name: qualcomm-fm-jni-libraries
         path: |
-          app/build/intermediates/stripped_native_libs/release/out/lib/arm64-v8a/*.so
-          app/build/intermediates/cmake/release/obj/arm64-v8a/*.so
+          app/build/**/*.so
         if-no-files-found: warn
 
     - name: Archive ProGuard Code Optimization Mappings
